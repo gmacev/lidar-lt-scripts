@@ -7,7 +7,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 GRID_FILE="${GRID_FILE:-$SCRIPT_DIR/grid.geojson}"
-DOWNLOAD_DIR="${DOWNLOAD_DIR:-/home/debian/lt-lidar-data}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/lt-lidar-data}"
 MAX_JOBS="${MAX_JOBS:-4}"
 RUN_PDAL_CLEANING="${RUN_PDAL_CLEANING:-true}"
 POTREE_ENCODING="${POTREE_ENCODING:-BROTLI}"

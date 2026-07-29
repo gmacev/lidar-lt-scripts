@@ -7,8 +7,7 @@ set -Eeuo pipefail
 #   chmod +x install_process_all_dependencies.sh
 #   ./install_process_all_dependencies.sh
 #
-# The script requests sudo only for Ubuntu packages and the original
-# /home/debian/lt-lidar-data output directory.
+# The script requests sudo only for Ubuntu packages.
 
 MINIFORGE_VERSION="26.3.2-3"
 MINIFORGE_SHA256="848194851a98903134187fbb4ab50efe87b003e0c0f808f97644b7524a62bf2c"
@@ -32,6 +31,7 @@ PDAL_ENV_DIR=""
 POTREE_ROOT=""
 POTREE_BUNDLE_DIR=""
 POTREE_ENTRYPOINT=""
+DEFAULT_OUTPUT_DIR=""
 
 log() {
     printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -98,6 +98,7 @@ resolve_target_account() {
     POTREE_ROOT="$TARGET_HOME/PotreeConverter"
     POTREE_BUNDLE_DIR="$POTREE_ROOT/releases/$POTREE_VERSION/PotreeConverter_linux_x64"
     POTREE_ENTRYPOINT="$POTREE_ROOT/build/PotreeConverter"
+    DEFAULT_OUTPUT_DIR="$TARGET_HOME/lt-lidar-data"
 }
 
 as_root() {
@@ -273,14 +274,7 @@ EOF
 }
 
 prepare_default_output_directory() {
-    # process_all.sh intentionally retains process_one.sh's original default.
-    if [[ ! -d /home/debian ]]; then
-        as_root install -d -m 755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
-            /home/debian
-    fi
-
-    as_root install -d -m 755 -o "$TARGET_USER" -g "$TARGET_GROUP" \
-        /home/debian/lt-lidar-data
+    as_target install -d -m 755 "$DEFAULT_OUTPUT_DIR"
 }
 
 verify_installation() {
@@ -303,13 +297,13 @@ verify_installation() {
     grep -q 'PotreeConverter <source> -o <outdir>' "$potree_help" ||
         die "PotreeConverter verification failed"
 
-    [[ -w /home/debian/lt-lidar-data ]] ||
+    as_target test -w "$DEFAULT_OUTPUT_DIR" ||
         die "default output directory is not writable"
 
     printf '\nInstalled and verified:\n'
     printf '  PDAL:            %s\n' "$pdal_version"
     printf '  PotreeConverter: %s\n' "$POTREE_ENTRYPOINT"
-    printf '  Output directory: /home/debian/lt-lidar-data\n'
+    printf '  Output directory: %s\n' "$DEFAULT_OUTPUT_DIR"
 }
 
 main() {
