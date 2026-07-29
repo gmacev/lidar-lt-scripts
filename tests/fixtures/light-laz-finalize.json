@@ -1,0 +1,22 @@
+[
+  {
+    "type": "readers.las",
+    "filename": "/tmp/lidar-pipeline-acceptance/fixture-light-raw.laz"
+  },
+  {
+    "type": "filters.assign",
+    "assignment": "Classification[:]=2"
+  },
+  {
+    "type": "filters.ferry",
+    "dimensions": "=>Overlap"
+  },
+  {
+    "type": "writers.las",
+    "filename": "/tmp/lidar-pipeline-acceptance/fixture-light.laz",
+    "compression": "laszip",
+    "minor_version": 4,
+    "dataformat_id": 6,
+    "extra_dims": "all"
+  }
+]

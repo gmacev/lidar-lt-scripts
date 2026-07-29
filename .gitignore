@@ -1,0 +1,42 @@
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local credentials and environment overrides
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime logs and sector result ledgers
+failed_sectors.txt
+succeded_sectors.txt
+pipeline_events.log
+*.log
+
+# Downloaded/extracted LiDAR data and generated point clouds
+downloads/
+output/
+outputs/
+work/
+*.las
+*.laz
+*.copc.laz
+
+# Temporary and archive files
+tmp/
+temp/
+*.part
+*.tmp
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Python test/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/

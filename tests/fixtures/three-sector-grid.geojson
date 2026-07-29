@@ -1,0 +1,29 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "01/01",
+        "url": "http://127.0.0.1:18765/01_01.zip"
+      },
+      "geometry": null
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "02/02",
+        "url": "http://127.0.0.1:18765/02_02.zip"
+      },
+      "geometry": null
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "03/03",
+        "url": "http://127.0.0.1:18765/03_03.zip"
+      },
+      "geometry": null
+    }
+  ]
+}

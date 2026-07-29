@@ -1,0 +1,15 @@
+[
+  {
+    "type": "readers.faux",
+    "bounds": "([0, 1000], [0, 1000], [0, 100])",
+    "count": 1000000,
+    "mode": "ramp"
+  },
+  {
+    "type": "writers.las",
+    "filename": "/tmp/lidar-pipeline-acceptance/fixture-heavy-raw.laz",
+    "compression": "laszip",
+    "minor_version": 4,
+    "dataformat_id": 6
+  }
+]
