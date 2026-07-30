@@ -12,14 +12,18 @@ MAX_JOBS="${MAX_JOBS:-4}"
 RUN_PDAL_CLEANING="${RUN_PDAL_CLEANING:-true}"
 POTREE_ENCODING="${POTREE_ENCODING:-BROTLI}"
 POTREE_CONVERTER="${POTREE_CONVERTER:-$HOME/PotreeConverter/build/PotreeConverter}"
+MIN_FREE_GB="${MIN_FREE_GB:-15}"
+MIN_FREE_BYTES=0
 MAX_SECTORS=0
 KEEP_LAZ=false
 
 FAILED_LOG=""
 SUCCEEDED_LOG=""
 EVENT_LOG=""
+STORAGE_STOP_LOG=""
 STATE_DIR=""
 DOWNLOAD_CACHE_DIR=""
+STORAGE_AVAILABLE_BYTES=0
 
 declare -a REQUESTED_SECTORS=()
 declare -a SECTOR_IDS=()
@@ -50,7 +54,7 @@ Options:
 
 Environment overrides:
   GRID_FILE, DOWNLOAD_DIR, MAX_JOBS, RUN_PDAL_CLEANING, POTREE_ENCODING,
-  POTREE_CONVERTER
+  POTREE_CONVERTER, MIN_FREE_GB (default: 15)
 EOF
 }
 
@@ -147,9 +151,12 @@ parse_args() {
 
 preflight() {
     [[ -f "$GRID_FILE" ]] || die "grid file not found: $GRID_FILE"
+    [[ "$MIN_FREE_GB" =~ ^[1-9][0-9]*$ ]] ||
+        die "MIN_FREE_GB must be a positive whole number"
+    MIN_FREE_BYTES=$((MIN_FREE_GB * 1024 * 1024 * 1024))
 
     local command_name
-    for command_name in jq wget unzip find xargs; do
+    for command_name in awk df jq wget unzip find xargs; do
         command -v "$command_name" >/dev/null 2>&1 ||
             die "required command not found: $command_name"
     done
@@ -182,11 +189,12 @@ preflight() {
     FAILED_LOG="$DOWNLOAD_DIR/failed_sectors.txt"
     SUCCEEDED_LOG="$DOWNLOAD_DIR/succeded_sectors.txt"
     EVENT_LOG="$DOWNLOAD_DIR/pipeline_events.log"
+    STORAGE_STOP_LOG="$DOWNLOAD_DIR/insufficient_storage.txt"
     STATE_DIR="$DOWNLOAD_DIR/.pipeline-state"
     DOWNLOAD_CACHE_DIR="$DOWNLOAD_DIR/.downloads"
 
     mkdir -p "$STATE_DIR" "$DOWNLOAD_CACHE_DIR"
-    touch "$FAILED_LOG" "$SUCCEEDED_LOG" "$EVENT_LOG"
+    touch "$FAILED_LOG" "$SUCCEEDED_LOG" "$EVENT_LOG" "$STORAGE_STOP_LOG"
 }
 
 load_sectors() {
@@ -249,6 +257,58 @@ write_prepare_status() {
     local step="$2"
     local detail="${3:-}"
     printf '%s\t%s\n' "$step" "$detail" > "$status_file"
+}
+
+sector_is_locally_prepared() {
+    local sector_id="$1"
+    local target_dir="$DOWNLOAD_DIR/$sector_id"
+
+    if output_is_complete "$target_dir/potree_output"; then
+        return 0
+    fi
+
+    [[ -f "$target_dir/.download_complete" ]] &&
+        find "$target_dir" -type f -name '*.laz' -print -quit | grep -q .
+}
+
+refresh_available_storage() {
+    local available_kb
+
+    available_kb="$(
+        df -Pk "$DOWNLOAD_DIR" |
+            awk 'NR == 2 { print $4; exit }'
+    )"
+
+    [[ "$available_kb" =~ ^[0-9]+$ ]] ||
+        die "could not determine available storage for $DOWNLOAD_DIR"
+
+    STORAGE_AVAILABLE_BYTES=$((available_kb * 1024))
+}
+
+storage_allows_download() {
+    refresh_available_storage
+    ((STORAGE_AVAILABLE_BYTES >= MIN_FREE_BYTES))
+}
+
+bytes_to_gib() {
+    awk -v bytes="$1" 'BEGIN { printf "%.2f", bytes / 1073741824 }'
+}
+
+log_storage_stop() {
+    local processed="$1"
+    local succeeded="$2"
+    local failed="$3"
+    local total="$4"
+    local last_sector="${5:-none}"
+    local stopped_before="${6:-none}"
+    local available_gib
+    local detail
+
+    available_gib="$(bytes_to_gib "$STORAGE_AVAILABLE_BYTES")"
+    detail="reason=insufficient-storage; available_bytes=$STORAGE_AVAILABLE_BYTES; available_gib=$available_gib; threshold_bytes=$MIN_FREE_BYTES; threshold_gib=$MIN_FREE_GB; processed=$processed; succeeded=$succeeded; failed=$failed; total=$total; last_sector=$last_sector; stopped_before=$stopped_before"
+
+    printf '%s\t%s\n' "$(timestamp)" "$detail" >> "$STORAGE_STOP_LOG"
+    event "storage-stop" "$stopped_before" "$detail"
 }
 
 prepare_sector() {
@@ -627,11 +687,27 @@ run_pipeline() {
     local prepare_detail
     local succeeded=0
     local failed=0
+    local storage_stopped=false
+    local stop_after_current=false
+    local stopped_before=""
+    local first_sector="${SECTOR_IDS[0]}"
 
     printf 'Processing %d sector(s). Data directory: %s\n' "$total" "$DOWNLOAD_DIR"
     printf 'Event evidence: %s\n' "$EVENT_LOG"
+    printf 'Download storage floor: %d GiB\n' "$MIN_FREE_GB"
 
-    prepare_sector "${SECTOR_IDS[0]}" "${SECTOR_URLS[0]}" &
+    if ! sector_is_locally_prepared "$first_sector" &&
+       ! storage_allows_download; then
+        event "storage-low-detected" "$first_sector" \
+            "available_bytes=$STORAGE_AVAILABLE_BYTES; threshold_bytes=$MIN_FREE_BYTES; no download started"
+        log_storage_stop 0 0 0 "$total" "none" "$first_sector"
+        printf 'Stopped before downloading %s: %s GiB available, %d GiB required.\n' \
+            "$first_sector" "$(bytes_to_gib "$STORAGE_AVAILABLE_BYTES")" "$MIN_FREE_GB"
+        printf 'Storage stop report: %s\n' "$STORAGE_STOP_LOG"
+        return 0
+    fi
+
+    prepare_sector "$first_sector" "${SECTOR_URLS[0]}" &
     current_prepare_pid=$!
     trap 'terminate_background_prepare "$current_prepare_pid"; terminate_background_prepare "$next_prepare_pid"; exit 130' INT TERM
 
@@ -648,13 +724,23 @@ run_pipeline() {
         fi
 
         next_prepare_pid=""
+        stop_after_current=false
+        stopped_before=""
         next_index=$((index + 1))
         if ((next_index < total)); then
-            prepare_sector \
-                "${SECTOR_IDS[$next_index]}" \
-                "${SECTOR_URLS[$next_index]}" &
-            next_prepare_pid=$!
-            event "prepare-backgrounded" "${SECTOR_IDS[$next_index]}" "pid=$next_prepare_pid"
+            stopped_before="${SECTOR_IDS[$next_index]}"
+            if ! sector_is_locally_prepared "$stopped_before" &&
+               ! storage_allows_download; then
+                stop_after_current=true
+                event "storage-low-detected" "$stopped_before" \
+                    "available_bytes=$STORAGE_AVAILABLE_BYTES; threshold_bytes=$MIN_FREE_BYTES; finishing_sector=$sector_id"
+            else
+                prepare_sector \
+                    "$stopped_before" \
+                    "${SECTOR_URLS[$next_index]}" &
+                next_prepare_pid=$!
+                event "prepare-backgrounded" "$stopped_before" "pid=$next_prepare_pid"
+            fi
         fi
 
         printf '[%d/%d] %s\n' "$((index + 1))" "$total" "$sector_id"
@@ -676,11 +762,24 @@ run_pipeline() {
             ((failed += 1))
         fi
 
+        if [[ "$stop_after_current" == true ]]; then
+            storage_stopped=true
+            log_storage_stop "$((index + 1))" "$succeeded" "$failed" "$total" \
+                "$sector_id" "$stopped_before"
+            break
+        fi
+
         current_prepare_pid="$next_prepare_pid"
     done
 
     trap - INT TERM
-    printf 'Finished: %d succeeded, %d failed, %d total.\n' "$succeeded" "$failed" "$total"
+    if [[ "$storage_stopped" == true ]]; then
+        printf 'Stopped safely for storage after %d/%d sectors: %d succeeded, %d failed.\n' \
+            "$((succeeded + failed))" "$total" "$succeeded" "$failed"
+        printf 'Storage stop report: %s\n' "$STORAGE_STOP_LOG"
+    else
+        printf 'Finished: %d succeeded, %d failed, %d total.\n' "$succeeded" "$failed" "$total"
+    fi
     printf 'Succeeded log: %s\nFailed log: %s\n' "$SUCCEEDED_LOG" "$FAILED_LOG"
 
     # Per-sector failures are recorded and intentionally do not make the whole
