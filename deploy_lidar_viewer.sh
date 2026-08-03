@@ -9,6 +9,8 @@ set -Eeuo pipefail
 
 DEFAULT_DEPLOY_ROOT="/srv/www/lidar-lt"
 DEFAULT_KEEP_RELEASES=3
+DEFAULT_RELEASE_REPOSITORY="${VIEWER_RELEASE_REPOSITORY:-gmacev/lidar-lt}"
+DEFAULT_ARTIFACT_NAME="lidar-lt-viewer.tar.gz"
 
 DEPLOY_ROOT="$DEFAULT_DEPLOY_ROOT"
 KEEP_RELEASES="$DEFAULT_KEEP_RELEASES"
@@ -27,6 +29,12 @@ STAGING_DIR=""
 usage() {
     cat <<'EOF'
 Usage:
+  ./deploy_lidar_viewer.sh
+
+Deploy a specific published release:
+  ./deploy_lidar_viewer.sh --release RELEASE_TAG
+
+Advanced/custom artifact usage:
   ./deploy_lidar_viewer.sh \
     --release COMMIT_OR_VERSION \
     --artifact-url URL \
@@ -42,13 +50,15 @@ Checksum source (choose exactly one):
   --checksum-url URL       Download a sha256sum-compatible checksum file
   --checksum-file FILE     Use a local sha256sum-compatible checksum file
 
-Required:
-  --release ID             Safe release name, normally a Git commit SHA or tag
-
 Options:
+  --release ID             Published release tag or custom release name
   --deploy-root DIR        Deployment root (default: /srv/www/lidar-lt)
   --keep-releases N        Total releases retained, including active (default: 3)
   -h, --help               Show this help
+
+With no artifact options, the script downloads the latest published release
+from gmacev/lidar-lt. Set VIEWER_RELEASE_REPOSITORY=OWNER/REPOSITORY to override
+that repository. Supplying only --release downloads that specific release.
 
 The deployment layout is:
   DEPLOY_ROOT/releases/RELEASE_ID/
@@ -153,6 +163,42 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+configure_published_release() {
+    local artifact_sources=0
+    local checksum_sources=0
+    local latest_url
+
+    [[ -n "$ARTIFACT_URL" ]] && (( artifact_sources += 1 ))
+    [[ -n "$ARTIFACT_FILE" ]] && (( artifact_sources += 1 ))
+    [[ -n "$EXPECTED_SHA256" ]] && (( checksum_sources += 1 ))
+    [[ -n "$CHECKSUM_URL" ]] && (( checksum_sources += 1 ))
+    [[ -n "$CHECKSUM_FILE" ]] && (( checksum_sources += 1 ))
+
+    if (( artifact_sources > 0 || checksum_sources > 0 )); then
+        return
+    fi
+
+    [[ "$DEFAULT_RELEASE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+        die "invalid VIEWER_RELEASE_REPOSITORY: $DEFAULT_RELEASE_REPOSITORY"
+    command -v curl >/dev/null 2>&1 || die "required command not found: curl"
+
+    if [[ -z "$RELEASE_ID" ]]; then
+        log "Resolving latest viewer release from $DEFAULT_RELEASE_REPOSITORY"
+        latest_url="$(
+            curl --fail --location --silent --show-error \
+                --output /dev/null --write-out '%{url_effective}' \
+                "https://github.com/$DEFAULT_RELEASE_REPOSITORY/releases/latest"
+        )"
+        RELEASE_ID="${latest_url##*/}"
+        [[ "$latest_url" == "https://github.com/$DEFAULT_RELEASE_REPOSITORY/releases/tag/$RELEASE_ID" ]] ||
+            die "could not resolve the latest published release"
+    fi
+
+    ARTIFACT_URL="https://github.com/$DEFAULT_RELEASE_REPOSITORY/releases/download/$RELEASE_ID/$DEFAULT_ARTIFACT_NAME"
+    CHECKSUM_URL="$ARTIFACT_URL.sha256"
+    log "Selected viewer release: $RELEASE_ID"
 }
 
 preflight() {
@@ -403,6 +449,7 @@ deploy() {
 
 main() {
     parse_args "$@"
+    configure_published_release
     preflight
     deploy
 }
