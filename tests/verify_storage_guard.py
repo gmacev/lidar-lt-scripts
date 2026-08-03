@@ -45,10 +45,12 @@ def main() -> None:
         "reason=insufficient-storage",
         "available_gib=10.00",
         "threshold_gib=15",
-        "processed=1",
-        "succeeded=1",
-        "failed=0",
-        "total=3",
+        "selected_total=3",
+        "existing_complete=0",
+        "newly_succeeded=1",
+        "failed_this_run=0",
+        "completed_total=1",
+        "remaining_unfinished=2",
         "last_sector=01_01",
         "stopped_before=02_02",
     ]
@@ -57,7 +59,7 @@ def main() -> None:
 
     print(
         "PASS: low storage blocked sector 2 download, sector 1 finished, "
-        "and 1/3 progress was recorded"
+        "and 1 complete / 2 unfinished was recorded"
     )
 
 

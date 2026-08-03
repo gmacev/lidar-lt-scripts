@@ -29,6 +29,9 @@ declare -a REQUESTED_SECTORS=()
 declare -a SECTOR_IDS=()
 declare -a SECTOR_URLS=()
 
+SELECTED_TOTAL=0
+EXISTING_COMPLETE=0
+
 CURRENT_SECTOR=""
 CURRENT_TARGET_DIR=""
 CURRENT_OUTPUT_DIR=""
@@ -41,6 +44,7 @@ usage() {
 Usage: ./process_all.sh [options]
 
 Processes all sectors in grid.geojson by default.
+Completed sectors with valid Potree output are skipped automatically on restart.
 
 Options:
   --grid FILE           GeoJSON grid to read (default: script_dir/grid.geojson)
@@ -252,6 +256,34 @@ load_sectors() {
     fi
 }
 
+filter_completed_sectors() {
+    local -a pending_ids=()
+    local -a pending_urls=()
+    local index
+    local sector_id
+
+    SELECTED_TOTAL="${#SECTOR_IDS[@]}"
+    EXISTING_COMPLETE=0
+
+    for index in "${!SECTOR_IDS[@]}"; do
+        sector_id="${SECTOR_IDS[$index]}"
+        if output_is_complete "$DOWNLOAD_DIR/$sector_id/potree_output"; then
+            EXISTING_COMPLETE=$((EXISTING_COMPLETE + 1))
+        else
+            pending_ids+=("$sector_id")
+            pending_urls+=("${SECTOR_URLS[$index]}")
+        fi
+    done
+
+    SECTOR_IDS=("${pending_ids[@]}")
+    SECTOR_URLS=("${pending_urls[@]}")
+
+    event "resume-scan" "-" \
+        "selected_total=$SELECTED_TOTAL; existing_complete=$EXISTING_COMPLETE; pending=${#SECTOR_IDS[@]}"
+    printf 'Resume scan: %d complete sector(s) skipped, %d pending of %d selected.\n' \
+        "$EXISTING_COMPLETE" "${#SECTOR_IDS[@]}" "$SELECTED_TOTAL"
+}
+
 write_prepare_status() {
     local status_file="$1"
     local step="$2"
@@ -295,17 +327,19 @@ bytes_to_gib() {
 }
 
 log_storage_stop() {
-    local processed="$1"
-    local succeeded="$2"
-    local failed="$3"
-    local total="$4"
-    local last_sector="${5:-none}"
-    local stopped_before="${6:-none}"
+    local newly_succeeded="$1"
+    local failed_this_run="$2"
+    local last_sector="${3:-none}"
+    local stopped_before="${4:-none}"
     local available_gib
+    local completed_total
+    local remaining_unfinished
     local detail
 
     available_gib="$(bytes_to_gib "$STORAGE_AVAILABLE_BYTES")"
-    detail="reason=insufficient-storage; available_bytes=$STORAGE_AVAILABLE_BYTES; available_gib=$available_gib; threshold_bytes=$MIN_FREE_BYTES; threshold_gib=$MIN_FREE_GB; processed=$processed; succeeded=$succeeded; failed=$failed; total=$total; last_sector=$last_sector; stopped_before=$stopped_before"
+    completed_total=$((EXISTING_COMPLETE + newly_succeeded))
+    remaining_unfinished=$((SELECTED_TOTAL - completed_total))
+    detail="reason=insufficient-storage; available_bytes=$STORAGE_AVAILABLE_BYTES; available_gib=$available_gib; threshold_bytes=$MIN_FREE_BYTES; threshold_gib=$MIN_FREE_GB; selected_total=$SELECTED_TOTAL; existing_complete=$EXISTING_COMPLETE; newly_succeeded=$newly_succeeded; failed_this_run=$failed_this_run; completed_total=$completed_total; remaining_unfinished=$remaining_unfinished; last_sector=$last_sector; stopped_before=$stopped_before"
 
     printf '%s\t%s\n' "$(timestamp)" "$detail" >> "$STORAGE_STOP_LOG"
     event "storage-stop" "$stopped_before" "$detail"
@@ -675,7 +709,7 @@ terminate_background_prepare() {
 }
 
 run_pipeline() {
-    local total="${#SECTOR_IDS[@]}"
+    local pending_total="${#SECTOR_IDS[@]}"
     local current_prepare_pid=""
     local next_prepare_pid=""
     local current_prepare_ok=false
@@ -690,9 +724,21 @@ run_pipeline() {
     local storage_stopped=false
     local stop_after_current=false
     local stopped_before=""
-    local first_sector="${SECTOR_IDS[0]}"
+    local first_sector
 
-    printf 'Processing %d sector(s). Data directory: %s\n' "$total" "$DOWNLOAD_DIR"
+    if ((pending_total == 0)); then
+        printf 'All %d selected sector(s) already have complete output; nothing to process.\n' \
+            "$SELECTED_TOTAL"
+        printf 'Succeeded log unchanged: %s\nFailed log: %s\n' \
+            "$SUCCEEDED_LOG" "$FAILED_LOG"
+        return 0
+    fi
+
+    first_sector="${SECTOR_IDS[0]}"
+
+    printf 'Processing %d pending sector(s) of %d selected. Data directory: %s\n' \
+        "$pending_total" "$SELECTED_TOTAL" "$DOWNLOAD_DIR"
+    printf 'Existing complete outputs skipped: %d\n' "$EXISTING_COMPLETE"
     printf 'Event evidence: %s\n' "$EVENT_LOG"
     printf 'Download storage floor: %d GiB\n' "$MIN_FREE_GB"
 
@@ -700,7 +746,7 @@ run_pipeline() {
        ! storage_allows_download; then
         event "storage-low-detected" "$first_sector" \
             "available_bytes=$STORAGE_AVAILABLE_BYTES; threshold_bytes=$MIN_FREE_BYTES; no download started"
-        log_storage_stop 0 0 0 "$total" "none" "$first_sector"
+        log_storage_stop 0 0 "none" "$first_sector"
         printf 'Stopped before downloading %s: %s GiB available, %d GiB required.\n' \
             "$first_sector" "$(bytes_to_gib "$STORAGE_AVAILABLE_BYTES")" "$MIN_FREE_GB"
         printf 'Storage stop report: %s\n' "$STORAGE_STOP_LOG"
@@ -727,7 +773,7 @@ run_pipeline() {
         stop_after_current=false
         stopped_before=""
         next_index=$((index + 1))
-        if ((next_index < total)); then
+        if ((next_index < pending_total)); then
             stopped_before="${SECTOR_IDS[$next_index]}"
             if ! sector_is_locally_prepared "$stopped_before" &&
                ! storage_allows_download; then
@@ -743,7 +789,7 @@ run_pipeline() {
             fi
         fi
 
-        printf '[%d/%d] %s\n' "$((index + 1))" "$total" "$sector_id"
+        printf '[%d/%d pending] %s\n' "$((index + 1))" "$pending_total" "$sector_id"
 
         if [[ "$current_prepare_ok" == true ]]; then
             if process_sector "$sector_id"; then
@@ -764,8 +810,7 @@ run_pipeline() {
 
         if [[ "$stop_after_current" == true ]]; then
             storage_stopped=true
-            log_storage_stop "$((index + 1))" "$succeeded" "$failed" "$total" \
-                "$sector_id" "$stopped_before"
+            log_storage_stop "$succeeded" "$failed" "$sector_id" "$stopped_before"
             break
         fi
 
@@ -774,11 +819,13 @@ run_pipeline() {
 
     trap - INT TERM
     if [[ "$storage_stopped" == true ]]; then
-        printf 'Stopped safely for storage after %d/%d sectors: %d succeeded, %d failed.\n' \
-            "$((succeeded + failed))" "$total" "$succeeded" "$failed"
+        printf 'Stopped safely for storage: %d existing complete, %d newly succeeded, %d failed this run, %d unfinished of %d selected.\n' \
+            "$EXISTING_COMPLETE" "$succeeded" "$failed" \
+            "$((SELECTED_TOTAL - EXISTING_COMPLETE - succeeded))" "$SELECTED_TOTAL"
         printf 'Storage stop report: %s\n' "$STORAGE_STOP_LOG"
     else
-        printf 'Finished: %d succeeded, %d failed, %d total.\n' "$succeeded" "$failed" "$total"
+        printf 'Finished pending pass: %d existing complete, %d newly succeeded, %d failed, %d selected total.\n' \
+            "$EXISTING_COMPLETE" "$succeeded" "$failed" "$SELECTED_TOTAL"
     fi
     printf 'Succeeded log: %s\nFailed log: %s\n' "$SUCCEEDED_LOG" "$FAILED_LOG"
 
@@ -791,6 +838,7 @@ main() {
     parse_args "$@"
     preflight
     load_sectors
+    filter_completed_sectors
     run_pipeline
 }
 
