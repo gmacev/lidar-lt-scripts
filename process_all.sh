@@ -12,6 +12,8 @@ MAX_JOBS="${MAX_JOBS:-4}"
 RUN_PDAL_CLEANING="${RUN_PDAL_CLEANING:-true}"
 POTREE_ENCODING="${POTREE_ENCODING:-BROTLI}"
 POTREE_CONVERTER="${POTREE_CONVERTER:-$HOME/PotreeConverter/build/PotreeConverter}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+LAS_BBOX_REPAIR_SCRIPT="$SCRIPT_DIR/repair_las_bounding_box.py"
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
 MIN_FREE_BYTES=0
 MAX_SECTORS=0
@@ -58,7 +60,7 @@ Options:
 
 Environment overrides:
   GRID_FILE, DOWNLOAD_DIR, MAX_JOBS, RUN_PDAL_CLEANING, POTREE_ENCODING,
-  POTREE_CONVERTER, MIN_FREE_GB (default: 15)
+  POTREE_CONVERTER, PYTHON_BIN, MIN_FREE_GB (default: 15)
 EOF
 }
 
@@ -164,6 +166,11 @@ preflight() {
         command -v "$command_name" >/dev/null 2>&1 ||
             die "required command not found: $command_name"
     done
+
+    command -v "$PYTHON_BIN" >/dev/null 2>&1 ||
+        die "required command not found: $PYTHON_BIN"
+    [[ -f "$LAS_BBOX_REPAIR_SCRIPT" ]] ||
+        die "LAS bounding-box repair helper not found: $LAS_BBOX_REPAIR_SCRIPT"
 
     local conda_init=""
     if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
@@ -604,7 +611,7 @@ clean_laz_files() {
             bash -c 'process_laz_file "$1"' _
 }
 
-run_potree_converter() {
+run_potree_converter_once() {
     local -a laz_files=()
     local -a potree_args=()
     local converter_dir
@@ -613,7 +620,6 @@ run_potree_converter() {
     mapfile -d '' laz_files < <(collect_laz_files)
     ((${#laz_files[@]} > 0)) || return 1
 
-    rm -rf "$CURRENT_OUTPUT_DIR"
     potree_args=(
         "${laz_files[@]}"
         -o "$CURRENT_OUTPUT_DIR"
@@ -631,6 +637,67 @@ run_potree_converter() {
         cd "$converter_dir" &&
         "$converter_name" "${potree_args[@]}"
     )
+}
+
+repair_bounding_box_files() {
+    local converter_log="$1"
+    local -a affected_files=()
+    local file
+
+    mapfile -t affected_files < <(
+        awk '/^[[:space:]]*file: / {sub(/^[[:space:]]*file: /, ""); print}' "$converter_log" |
+            sort -u
+    )
+    ((${#affected_files[@]} > 0)) || return 1
+
+    for file in "${affected_files[@]}"; do
+        [[ -f "$file" && "$file" == *.laz ]] || return 1
+        event "bbox-repair-start" "$CURRENT_SECTOR" "$file"
+        if "$PYTHON_BIN" "$LAS_BBOX_REPAIR_SCRIPT" "$file"; then
+            event "bbox-repair-end" "$CURRENT_SECTOR" "$file"
+        else
+            event "bbox-repair-failed" "$CURRENT_SECTOR" "$file"
+            return 1
+        fi
+    done
+}
+
+run_potree_converter() {
+    local converter_log
+    local converter_status
+    local retry_status
+
+    converter_log="$(mktemp "$STATE_DIR/potree-${CURRENT_SECTOR}.XXXXXX.log")" ||
+        return 1
+
+    rm -rf "$CURRENT_OUTPUT_DIR"
+    run_potree_converter_once 2>&1 | tee "$converter_log"
+    converter_status="${PIPESTATUS[0]}"
+    if ((converter_status == 0)); then
+        rm -f "$converter_log"
+        return 0
+    fi
+
+    if [[ -f "$CURRENT_OUTPUT_DIR/log.txt" ]]; then
+        cat "$CURRENT_OUTPUT_DIR/log.txt" >> "$converter_log"
+    fi
+
+    if ! grep -q 'point outside bounding box' "$converter_log"; then
+        rm -f "$converter_log"
+        return "$converter_status"
+    fi
+
+    event "bbox-repair-triggered" "$CURRENT_SECTOR"
+    if ! repair_bounding_box_files "$converter_log"; then
+        rm -f "$converter_log"
+        return 1
+    fi
+
+    rm -rf "$CURRENT_OUTPUT_DIR"
+    run_potree_converter_once 2>&1 | tee -a "$converter_log"
+    retry_status="${PIPESTATUS[0]}"
+    rm -f "$converter_log"
+    return "$retry_status"
 }
 
 validate_potree_output() {
