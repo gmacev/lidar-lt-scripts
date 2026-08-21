@@ -15,10 +15,12 @@ failed_sectors.txt
 succeded_sectors.txt
 pipeline_events.log
 insufficient_storage.txt
+skipped_laz_files.txt
 *.log
 
 # Downloaded/extracted LiDAR data and generated point clouds
 downloads/
+.skipped-laz/
 output/
 outputs/
 work/

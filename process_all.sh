@@ -25,6 +25,8 @@ FAILED_LOG=""
 SUCCEEDED_LOG=""
 EVENT_LOG=""
 STORAGE_STOP_LOG=""
+SKIPPED_LAZ_LOG=""
+SKIPPED_LAZ_DIR=""
 STATE_DIR=""
 DOWNLOAD_CACHE_DIR=""
 STORAGE_AVAILABLE_BYTES=0
@@ -68,6 +70,10 @@ Options:
 Environment overrides:
   GRID_FILE, DOWNLOAD_DIR, MAX_JOBS, RUN_PDAL_CLEANING, POTREE_ENCODING,
   POTREE_CONVERTER, PYTHON_BIN, MIN_FREE_GB (default: 15)
+
+If an individual LAZ file fails PDAL cleaning, it is quarantined and omitted
+from Potree conversion; the sector is marked partial in source_manifest.json
+and recorded in skipped_laz_files.txt.
 EOF
 }
 
@@ -278,11 +284,13 @@ preflight() {
     SUCCEEDED_LOG="$DOWNLOAD_DIR/succeded_sectors.txt"
     EVENT_LOG="$DOWNLOAD_DIR/pipeline_events.log"
     STORAGE_STOP_LOG="$DOWNLOAD_DIR/insufficient_storage.txt"
+    SKIPPED_LAZ_LOG="$DOWNLOAD_DIR/skipped_laz_files.txt"
+    SKIPPED_LAZ_DIR="$DOWNLOAD_DIR/.skipped-laz"
     STATE_DIR="$DOWNLOAD_DIR/.pipeline-state"
     DOWNLOAD_CACHE_DIR="$DOWNLOAD_DIR/.downloads"
 
-    mkdir -p "$STATE_DIR" "$DOWNLOAD_CACHE_DIR"
-    touch "$FAILED_LOG" "$SUCCEEDED_LOG" "$EVENT_LOG" "$STORAGE_STOP_LOG"
+    mkdir -p "$STATE_DIR" "$DOWNLOAD_CACHE_DIR" "$SKIPPED_LAZ_DIR"
+    touch "$FAILED_LOG" "$SUCCEEDED_LOG" "$EVENT_LOG" "$STORAGE_STOP_LOG" "$SKIPPED_LAZ_LOG"
 }
 
 load_sectors() {
@@ -574,6 +582,67 @@ validate_input() {
     collect_laz_files | grep -q .
 }
 
+recalculate_manifest_summary() {
+    local manifest="$1"
+
+    jq '
+        .sourceFileCount = (.sourceFiles | length) |
+        .pointCount = ([.sourceFiles[].pointCount // 0] | add // 0) |
+        .software = ([.sourceFiles[].software | select(. != null and . != "")] | unique) |
+        .pointFormats = ([.sourceFiles[].pointFormat | select(. != null)] | unique | sort) |
+        .sourceFileDateRange = {
+            from: ([.sourceFiles[].creationDate | select(. != null)] | min // null),
+            to: ([.sourceFiles[].creationDate | select(. != null)] | max // null)
+        } |
+        .creationYearRange = {
+            from: ([.sourceFiles[].creationYear | select(. != null)] | min // null),
+            to: ([.sourceFiles[].creationYear | select(. != null)] | max // null)
+        } |
+        .bounds = {
+            minx: ([.sourceFiles[].bounds.minx | select(. != null)] | min // null),
+            miny: ([.sourceFiles[].bounds.miny | select(. != null)] | min // null),
+            minz: ([.sourceFiles[].bounds.minz | select(. != null)] | min // null),
+            maxx: ([.sourceFiles[].bounds.maxx | select(. != null)] | max // null),
+            maxy: ([.sourceFiles[].bounds.maxy | select(. != null)] | max // null),
+            maxz: ([.sourceFiles[].bounds.maxz | select(. != null)] | max // null)
+        }
+    ' "$manifest" > "$manifest.next" || return 1
+
+    mv "$manifest.next" "$manifest"
+}
+
+mark_manifest_laz_skipped() {
+    local file_path="$1"
+    local quarantine_path="$2"
+    local file_name
+    local skipped_at
+
+    file_name="$(basename "$file_path")"
+    skipped_at="$(timestamp)"
+
+    jq \
+        --arg name "$file_name" \
+        --arg skippedAt "$skipped_at" \
+        --arg quarantinePath "$quarantine_path" \
+        '
+            .sourceFileCountBeforeSkip =
+                (.sourceFileCountBeforeSkip // .sourceFileCount // 0) |
+            .pointCountBeforeSkip =
+                (.pointCountBeforeSkip // .pointCount // 0) |
+            .sourceFiles = [.sourceFiles[] | select(.name != $name)] |
+            .skippedLazFiles = ((.skippedLazFiles // []) + [{
+                name: $name,
+                step: "pdal-cleaning",
+                skippedAt: $skippedAt,
+                quarantinePath: $quarantinePath
+            }]) |
+            .partial = true
+        ' "$CURRENT_MANIFEST_TMP" > "$CURRENT_MANIFEST_TMP.next" || return 1
+
+    mv "$CURRENT_MANIFEST_TMP.next" "$CURRENT_MANIFEST_TMP" || return 1
+    recalculate_manifest_summary "$CURRENT_MANIFEST_TMP"
+}
+
 generate_source_manifest() {
     local -a laz_files=()
     local file
@@ -658,30 +727,7 @@ generate_source_manifest() {
         mv "$CURRENT_MANIFEST_TMP.next" "$CURRENT_MANIFEST_TMP" || return 1
     done
 
-    jq '
-        .sourceFileCount = (.sourceFiles | length) |
-        .pointCount = ([.sourceFiles[].pointCount // 0] | add // 0) |
-        .software = ([.sourceFiles[].software | select(. != null and . != "")] | unique) |
-        .pointFormats = ([.sourceFiles[].pointFormat | select(. != null)] | unique | sort) |
-        .sourceFileDateRange = {
-            from: ([.sourceFiles[].creationDate | select(. != null)] | min // null),
-            to: ([.sourceFiles[].creationDate | select(. != null)] | max // null)
-        } |
-        .creationYearRange = {
-            from: ([.sourceFiles[].creationYear | select(. != null)] | min // null),
-            to: ([.sourceFiles[].creationYear | select(. != null)] | max // null)
-        } |
-        .bounds = {
-            minx: ([.sourceFiles[].bounds.minx | select(. != null)] | min // null),
-            miny: ([.sourceFiles[].bounds.miny | select(. != null)] | min // null),
-            minz: ([.sourceFiles[].bounds.minz | select(. != null)] | min // null),
-            maxx: ([.sourceFiles[].bounds.maxx | select(. != null)] | max // null),
-            maxy: ([.sourceFiles[].bounds.maxy | select(. != null)] | max // null),
-            maxz: ([.sourceFiles[].bounds.maxz | select(. != null)] | max // null)
-        }
-    ' "$CURRENT_MANIFEST_TMP" > "$CURRENT_MANIFEST_TMP.next" || return 1
-
-    mv "$CURRENT_MANIFEST_TMP.next" "$CURRENT_MANIFEST_TMP"
+    recalculate_manifest_summary "$CURRENT_MANIFEST_TMP"
 }
 
 ensure_source_manifest() {
@@ -722,9 +768,59 @@ export -f process_laz_file
 clean_laz_files() {
     [[ "$RUN_PDAL_CLEANING" == true ]] || return 0
 
+    local pdal_failure_dir="$CURRENT_TARGET_DIR/.pdal-failures"
+    local xargs_status=0
+    local marker
+    local file
+    local file_name
+    local quarantine_path
+
+    rm -rf -- "$pdal_failure_dir" || return 1
+    mkdir -p -- "$pdal_failure_dir" "$SKIPPED_LAZ_DIR/$CURRENT_SECTOR" || return 1
+
+    PDAL_FAILURE_DIR="$pdal_failure_dir"
+    export PDAL_FAILURE_DIR
+
     collect_laz_files |
         xargs -0 -r -n 1 -P "$MAX_JOBS" \
-            bash -c 'process_laz_file "$1"' _
+            bash -c '
+                file="$1"
+                if process_laz_file "$file"; then
+                    exit 0
+                fi
+
+                rm -f -- "${file%.laz}_clean.laz"
+                marker="$PDAL_FAILURE_DIR/$(basename "$file").$BASHPID.path"
+                printf "%s\n" "$file" > "$marker" || exit 1
+                exit 0
+            ' _ || xargs_status=$?
+
+    unset PDAL_FAILURE_DIR
+    ((xargs_status == 0)) || return "$xargs_status"
+
+    while IFS= read -r -d '' marker; do
+        IFS= read -r file < "$marker" || return 1
+        [[ -f "$file" ]] || return 1
+
+        file_name="$(basename "$file")"
+        quarantine_path="$SKIPPED_LAZ_DIR/$CURRENT_SECTOR/$file_name"
+        mv -f -- "$file" "$quarantine_path" || return 1
+
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$(timestamp)" \
+            "$CURRENT_SECTOR" \
+            "pdal-cleaning" \
+            "$file" \
+            "$quarantine_path" >> "$SKIPPED_LAZ_LOG" || return 1
+        event "laz-skipped" "$CURRENT_SECTOR" \
+            "step=pdal-cleaning; file=$file; quarantine=$quarantine_path"
+
+        mark_manifest_laz_skipped "$file" "$quarantine_path" || return 1
+        rm -f -- "$marker" || return 1
+    done < <(find "$pdal_failure_dir" -type f -name '*.path' -print0)
+
+    rm -rf -- "$pdal_failure_dir"
+    collect_laz_files | grep -q .
 }
 
 run_potree_converter_once() {
@@ -1010,7 +1106,8 @@ run_pipeline() {
         printf 'Finished pending pass: %d existing complete, %d newly succeeded, %d failed, %d selected total.\n' \
             "$EXISTING_COMPLETE" "$succeeded" "$failed" "$SELECTED_TOTAL"
     fi
-    printf 'Succeeded log: %s\nFailed log: %s\n' "$SUCCEEDED_LOG" "$FAILED_LOG"
+    printf 'Succeeded log: %s\nFailed log: %s\nSkipped LAZ log: %s\n' \
+        "$SUCCEEDED_LOG" "$FAILED_LOG" "$SKIPPED_LAZ_LOG"
 
     # Per-sector failures are recorded and intentionally do not make the whole
     # batch exit non-zero. A non-zero exit is reserved for global/preflight errors.
