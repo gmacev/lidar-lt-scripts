@@ -18,6 +18,8 @@ MIN_FREE_GB="${MIN_FREE_GB:-15}"
 MIN_FREE_BYTES=0
 MAX_SECTORS=0
 KEEP_LAZ=false
+REPROCESS=false
+SECTOR_LIST_FILE=""
 
 FAILED_LOG=""
 SUCCEEDED_LOG=""
@@ -28,6 +30,7 @@ DOWNLOAD_CACHE_DIR=""
 STORAGE_AVAILABLE_BYTES=0
 
 declare -a REQUESTED_SECTORS=()
+declare -A REQUESTED_URL_BY_ID=()
 declare -a SECTOR_IDS=()
 declare -a SECTOR_URLS=()
 
@@ -46,16 +49,20 @@ usage() {
 Usage: ./process_all.sh [options]
 
 Processes all sectors in grid.geojson by default.
-Completed sectors with valid Potree output are skipped automatically on restart.
+Completed sectors with valid Potree output are skipped automatically on restart,
+unless explicitly selected with --reprocess.
 
 Options:
   --grid FILE           GeoJSON grid to read (default: script_dir/grid.geojson)
   --download-dir DIR    Data and log directory (default: $HOME/lt-lidar-data)
   --max-sectors N       Process only the first N selected sectors (testing/resume aid)
   --sector ID           Process one sector ID; may be repeated (example: --sector 35_71)
+  --sector-list FILE    Select sectors from IDs, CSV rows, or archive URLs in FILE
   --max-jobs N          Parallel PDAL jobs per sector (default: 4)
   --skip-pdal           Skip PDAL cleaning, but still generate metadata with PDAL
   --keep-laz            Keep source LAZ files after successful conversion
+  --reprocess           Clean and rebuild the explicitly selected sectors from scratch
+                        (requires --sector or --sector-list; never reprocesses the whole grid by accident)
   -h, --help            Show this help
 
 Environment overrides:
@@ -90,12 +97,32 @@ log_failure() {
 
 log_success() {
     local sector_id="$1"
-    printf '%s\t%s\n' "$(timestamp)" "$sector_id" >> "$SUCCEEDED_LOG"
+    if ! awk -v id="$sector_id" \
+        '$2 == id { found=1 } END { exit(found ? 0 : 1) }' \
+        "$SUCCEEDED_LOG"; then
+        printf '%s\t%s\n' "$(timestamp)" "$sector_id" >> "$SUCCEEDED_LOG"
+    fi
     event "sector-succeeded" "$sector_id"
 }
 
 normalize_sector_id() {
     printf '%s' "$1" | tr '/' '_'
+}
+
+append_requested_sector() {
+    local sector_id="$1"
+    local url="${2:-}"
+    local existing
+
+    for existing in "${REQUESTED_SECTORS[@]}"; do
+        if [[ "$existing" == "$sector_id" ]]; then
+            [[ -n "$url" ]] && REQUESTED_URL_BY_ID["$sector_id"]="$url"
+            return 0
+        fi
+    done
+
+    REQUESTED_SECTORS+=("$sector_id")
+    [[ -n "$url" ]] && REQUESTED_URL_BY_ID["$sector_id"]="$url"
 }
 
 output_is_complete() {
@@ -127,7 +154,12 @@ parse_args() {
                 ;;
             --sector)
                 (($# >= 2)) || die "--sector requires an ID"
-                REQUESTED_SECTORS+=("$(normalize_sector_id "$2")")
+                append_requested_sector "$(normalize_sector_id "$2")"
+                shift 2
+                ;;
+            --sector-list)
+                (($# >= 2)) || die "--sector-list requires a file"
+                SECTOR_LIST_FILE="$2"
                 shift 2
                 ;;
             --max-jobs)
@@ -144,6 +176,10 @@ parse_args() {
                 KEEP_LAZ=true
                 shift
                 ;;
+            --reprocess)
+                REPROCESS=true
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -153,6 +189,47 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+load_sector_list() {
+    local line
+    local first_field
+    local url
+    local sector_id
+    local url_pattern='(https?://[^,[:space:]]+)'
+    local archive_id_pattern='/([0-9]+)[_/]([0-9]+)\.zip'
+
+    [[ -n "$SECTOR_LIST_FILE" ]] || return 0
+    [[ -f "$SECTOR_LIST_FILE" ]] || die "sector list file not found: $SECTOR_LIST_FILE"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "${line//[[:space:]]/}" ]] || continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+        url=""
+        sector_id=""
+        if [[ "$line" =~ $url_pattern ]]; then
+            url="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$url" && "$url" =~ $archive_id_pattern ]]; then
+            sector_id="${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
+        else
+            first_field="${line%%,*}"
+            first_field="${first_field%%$'\t'*}"
+            first_field="${first_field//[[:space:]]/}"
+            [[ "${first_field,,}" == *indeksas* ]] && continue
+            sector_id="$(normalize_sector_id "$first_field")"
+        fi
+
+        [[ "$sector_id" =~ ^[0-9]+_[0-9]+$ ]] ||
+            die "invalid sector-list entry: $line"
+        append_requested_sector "$sector_id" "$url"
+    done < "$SECTOR_LIST_FILE"
+
+    ((${#REQUESTED_SECTORS[@]} > 0)) ||
+        die "sector list contains no sector IDs: $SECTOR_LIST_FILE"
 }
 
 preflight() {
@@ -242,13 +319,15 @@ load_sectors() {
         local requested
         local found
         local index
+        local requested_url
 
         for requested in "${REQUESTED_SECTORS[@]}"; do
             found=false
             for index in "${!all_ids[@]}"; do
                 if [[ "${all_ids[$index]}" == "$requested" ]]; then
                     SECTOR_IDS+=("${all_ids[$index]}")
-                    SECTOR_URLS+=("${all_urls[$index]}")
+                    requested_url="${REQUESTED_URL_BY_ID[$requested]:-}"
+                    SECTOR_URLS+=("${requested_url:-${all_urls[$index]}}")
                     found=true
                     break
                 fi
@@ -263,6 +342,12 @@ load_sectors() {
     fi
 }
 
+validate_selection() {
+    if [[ "$REPROCESS" == true && ${#REQUESTED_SECTORS[@]} -eq 0 ]]; then
+        die "--reprocess requires --sector or --sector-list; refusing to reprocess the entire grid"
+    fi
+}
+
 filter_completed_sectors() {
     local -a pending_ids=()
     local -a pending_urls=()
@@ -271,6 +356,14 @@ filter_completed_sectors() {
 
     SELECTED_TOTAL="${#SECTOR_IDS[@]}"
     EXISTING_COMPLETE=0
+
+    if [[ "$REPROCESS" == true ]]; then
+        event "reprocess-scan" "-" \
+            "selected_total=$SELECTED_TOTAL; pending=$SELECTED_TOTAL; existing_complete=0"
+        printf 'Clean reprocess scan: %d explicitly selected sector(s) will be rebuilt.\n' \
+            "$SELECTED_TOTAL"
+        return 0
+    fi
 
     for index in "${!SECTOR_IDS[@]}"; do
         sector_id="${SECTOR_IDS[$index]}"
@@ -301,6 +394,8 @@ write_prepare_status() {
 sector_is_locally_prepared() {
     local sector_id="$1"
     local target_dir="$DOWNLOAD_DIR/$sector_id"
+
+    [[ "$REPROCESS" == true ]] && return 1
 
     if output_is_complete "$target_dir/potree_output"; then
         return 0
@@ -333,6 +428,21 @@ bytes_to_gib() {
     awk -v bytes="$1" 'BEGIN { printf "%.2f", bytes / 1073741824 }'
 }
 
+clean_reprocess_sector() {
+    local sector_id="$1"
+    local target_dir="$DOWNLOAD_DIR/$sector_id"
+    local status_file="$STATE_DIR/$sector_id.prepare"
+    local archive="$DOWNLOAD_CACHE_DIR/$sector_id.zip"
+
+    [[ "$sector_id" =~ ^[0-9]+_[0-9]+$ ]] || return 1
+    [[ "$target_dir" == "$DOWNLOAD_DIR/"* ]] || return 1
+
+    event "reprocess-clean-start" "$sector_id" "$target_dir"
+    rm -rf -- "$target_dir" || return 1
+    rm -f -- "$status_file" "$archive" "$archive.part" || return 1
+    event "reprocess-clean-end" "$sector_id" "old sector state removed"
+}
+
 log_storage_stop() {
     local newly_succeeded="$1"
     local failed_this_run="$2"
@@ -362,6 +472,12 @@ prepare_sector() {
     local partial_archive="$archive.part"
 
     event "prepare-start" "$sector_id" "$url"
+
+    if [[ "$REPROCESS" == true ]] && ! clean_reprocess_sector "$sector_id"; then
+        write_prepare_status "$status_file" "reprocess-clean" "could not remove old sector state"
+        event "reprocess-clean-failed" "$sector_id" "could not remove old sector state"
+        return 1
+    fi
 
     if output_is_complete "$output_dir"; then
         write_prepare_status "$status_file" "ready" "existing complete output"
@@ -904,6 +1020,8 @@ run_pipeline() {
 main() {
     parse_args "$@"
     preflight
+    load_sector_list
+    validate_selection
     load_sectors
     filter_completed_sectors
     run_pipeline
