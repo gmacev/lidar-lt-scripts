@@ -14,9 +14,10 @@ than the survey year or LAS version:
 * at least 90% of class-1 points are within 0.25 m of the mean class-2 Z in
   their 1 m XY cell.
 
-When the trigger matches, every class-1 point is rewritten as class 2 in a
-temporary output file.  The caller then applies the unchanged PDAL range
-filter and LAS writer options.
+The production caller aggregates these measurements across every LAZ in a
+sector.  When the sector trigger matches, every class-1 point in every source
+file is rewritten as class 2 in a temporary output file.  The caller then
+applies the unchanged PDAL range filter and LAS writer options.
 """
 
 from __future__ import annotations
@@ -168,10 +169,10 @@ def analyse_file(path: Path) -> dict[str, Any]:
     ground_like_fraction = (
         ground_like_count / class1_count if class1_count else 0.0
     )
-    remapped = (
-        class1_count >= MIN_CLASS1_POINTS
-        and class1_share >= MIN_CLASS1_SHARE
-        and ground_like_fraction >= MIN_GROUND_LIKE_FRACTION
+    remapped = remap_trigger(
+        total_count,
+        class1_count,
+        ground_like_count,
     )
 
     return {
@@ -195,6 +196,24 @@ def analyse_file(path: Path) -> dict[str, Any]:
     }
 
 
+def remap_trigger(
+    total_count: int,
+    class1_count: int,
+    ground_like_count: int,
+) -> bool:
+    """Return whether the aggregated class-1 population is affected."""
+
+    class1_share = class1_count / total_count if total_count else 0.0
+    ground_like_fraction = (
+        ground_like_count / class1_count if class1_count else 0.0
+    )
+    return (
+        class1_count >= MIN_CLASS1_POINTS
+        and class1_share >= MIN_CLASS1_SHARE
+        and ground_like_fraction >= MIN_GROUND_LIKE_FRACTION
+    )
+
+
 def remap_class1(path: Path, destination: Path) -> None:
     """Write a copy with every class-1 point assigned to class 2."""
 
@@ -216,15 +235,41 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Detect and optionally remap ground-like LAS class-1 points."
     )
+    parser.add_argument(
+        "--analyse-only",
+        action="store_true",
+        help="analyse one source and print JSON without writing a remap copy",
+    )
+    parser.add_argument(
+        "--remap-only",
+        action="store_true",
+        help="write a remap copy without re-evaluating the trigger",
+    )
     parser.add_argument("source", type=Path)
-    parser.add_argument("remap_output", type=Path)
+    parser.add_argument("remap_output", type=Path, nargs="?")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.analyse_only and args.remap_only:
+            raise ValueError("--analyse-only and --remap-only are mutually exclusive")
+
+        if args.remap_only:
+            if args.remap_output is None:
+                raise ValueError("--remap-only requires a destination path")
+            remap_class1(args.source, args.remap_output)
+            return 0
+
         result = analyse_file(args.source)
+        if args.analyse_only:
+            print(json.dumps(result, separators=(",", ":")))
+            return 0
+
+        if args.remap_output is None:
+            raise ValueError("a remap destination is required")
+
         if result["remapped"]:
             remap_class1(args.source, args.remap_output)
             result["remappedClass1Points"] = result["class1Points"]

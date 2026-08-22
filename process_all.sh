@@ -26,6 +26,7 @@ MAX_SECTORS=0
 KEEP_LAZ=false
 REPROCESS=false
 SECTOR_LIST_FILE=""
+REMAP_CLASS1_GROUND=false
 
 FAILED_LOG=""
 SUCCEEDED_LOG=""
@@ -756,7 +757,6 @@ process_laz_file() {
     local file="$1"
     local temp_file="${file%.laz}_clean.laz"
     local remap_file
-    local remap_result
     local input_file="$file"
     local range_limits='Overlap[0:0],Classification[1:7],Z[:600]'
 
@@ -765,15 +765,13 @@ process_laz_file() {
     remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
     rm -f -- "$remap_file"
 
-    if ! remap_result="$("$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" "$file" "$remap_file")"; then
-        rm -f -- "$remap_file"
-        return 1
-    fi
-
-    if [[ "$(jq -r '.remapped' <<< "$remap_result")" == true ]]; then
+    if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+        if ! "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
+            --remap-only "$file" "$remap_file"; then
+            rm -f -- "$remap_file"
+            return 1
+        fi
         input_file="$remap_file"
-        event "class1-ground-remap" "$CURRENT_SECTOR" \
-            "file=$file;class1Points=$(jq -r '.class1Points' <<< "$remap_result");class1Share=$(jq -r '.class1Share' <<< "$remap_result");groundLikeFraction=$(jq -r '.groundLikeFraction' <<< "$remap_result")"
     else
         rm -f -- "$remap_file"
     fi
@@ -782,7 +780,7 @@ process_laz_file() {
     # implicitly non-overlap, so omitting only that unavailable predicate keeps
     # the original filtering semantics and avoids a PDAL "Invalid dimension"
     # failure.
-    if ! pdal info --schema "$file" |
+    if ! pdal info --schema "$input_file" |
         jq -e '.schema.dimensions | any(.name == "Overlap")' >/dev/null; then
         range_limits='Classification[1:7],Z[:600]'
     fi
@@ -806,6 +804,8 @@ export -f process_laz_file
 clean_laz_files() {
     local pdal_failure_dir="$CURRENT_TARGET_DIR/.pdal-failures"
     local xargs_status=0
+    local ground_remap_analysis
+    local ground_remap_detail
     local marker
     local file
     local file_name
@@ -818,12 +818,110 @@ clean_laz_files() {
         -name '*.ground-remap.*.laz' \
         -delete || return 1
 
+    REMAP_CLASS1_GROUND=false
     [[ "$RUN_PDAL_CLEANING" == true ]] || return 0
 
     PDAL_FAILURE_DIR="$pdal_failure_dir"
-    export PDAL_FAILURE_DIR
-    export GROUND_REMAP_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR
+    export PDAL_FAILURE_DIR GROUND_REMAP_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR \
+        REMAP_CLASS1_GROUND
     export -f timestamp event process_laz_file
+
+    ground_remap_analysis="$(
+        collect_laz_files |
+            xargs -0 -r -n 1 -P "$MAX_JOBS" \
+                bash -c '
+                    if "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$1"; then
+                        exit 0
+                    fi
+                    printf '{"analysisFailed":true}\n'
+                    exit 0
+                ' _ |
+            jq -s -c '
+                . as $reports |
+                ($reports | map(select(.analysisFailed != true))) as $valid |
+                ($reports | length) as $file_count |
+                ($reports | map(select(.analysisFailed == true)) | length) as $analysis_failed |
+                if ($valid | length) == 0 then
+                    {
+                        fileCount: $file_count,
+                        analysisFailedFiles: $analysis_failed,
+                        totalPoints: 0,
+                        class0Points: 0,
+                        class1Points: 0,
+                        class2Points: 0,
+                        class12Points: 0,
+                        class1Share: 0,
+                        groundLikeClass1Points: 0,
+                        groundLikeFraction: 0,
+                        remapped: false,
+                        thresholds: {}
+                    }
+                else
+                    def sum_field($field): $valid | map(.[$field]) | add;
+                    {
+                        fileCount: $file_count,
+                        analysisFailedFiles: $analysis_failed,
+                        totalPoints: sum_field("totalPoints"),
+                        class0Points: sum_field("class0Points"),
+                        class1Points: sum_field("class1Points"),
+                        class2Points: sum_field("class2Points"),
+                        class12Points: sum_field("class12Points"),
+                        class1Share: (
+                            if sum_field("totalPoints") > 0
+                            then sum_field("class1Points") / sum_field("totalPoints")
+                            else 0
+                            end
+                        ),
+                        groundLikeClass1Points: sum_field("groundLikeClass1Points"),
+                        groundLikeFraction: (
+                            if sum_field("class1Points") > 0
+                            then sum_field("groundLikeClass1Points") / sum_field("class1Points")
+                            else 0
+                            end
+                        ),
+                        remapped: (
+                            sum_field("class1Points") >= $valid[0].thresholds.minClass1Points
+                            and (
+                                if sum_field("totalPoints") > 0
+                                then sum_field("class1Points") / sum_field("totalPoints")
+                                else 0
+                                end
+                            ) >= $valid[0].thresholds.minClass1Share
+                            and (
+                                if sum_field("class1Points") > 0
+                                then sum_field("groundLikeClass1Points") / sum_field("class1Points")
+                                else 0
+                                end
+                            ) >= $valid[0].thresholds.minGroundLikeFraction
+                        ),
+                        thresholds: $valid[0].thresholds
+                    }
+                end
+            '
+    )" || {
+        unset PDAL_FAILURE_DIR
+        return 1
+    }
+
+    REMAP_CLASS1_GROUND="$(jq -r '.remapped' <<< "$ground_remap_analysis")" || {
+        unset PDAL_FAILURE_DIR
+        return 1
+    }
+    [[ "$REMAP_CLASS1_GROUND" == true || "$REMAP_CLASS1_GROUND" == false ]] || {
+        unset PDAL_FAILURE_DIR
+        return 1
+    }
+    ground_remap_detail="$(
+        jq -r '"scope=sector;files=\(.fileCount);analysisFailedFiles=\(.analysisFailedFiles);class1Points=\(.class1Points);class1Share=\(.class1Share);groundLikeFraction=\(.groundLikeFraction);remapped=\(.remapped)"' \
+            <<< "$ground_remap_analysis"
+    )" || {
+        unset PDAL_FAILURE_DIR
+        return 1
+    }
+    event "class1-ground-remap-scan" "$CURRENT_SECTOR" "$ground_remap_detail"
+    if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+        event "class1-ground-remap" "$CURRENT_SECTOR" "$ground_remap_detail"
+    fi
 
     collect_laz_files |
         xargs -0 -r -n 1 -P "$MAX_JOBS" \
