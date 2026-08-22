@@ -12,8 +12,14 @@ MAX_JOBS="${MAX_JOBS:-4}"
 RUN_PDAL_CLEANING="${RUN_PDAL_CLEANING:-true}"
 POTREE_ENCODING="${POTREE_ENCODING:-BROTLI}"
 POTREE_CONVERTER="${POTREE_CONVERTER:-$HOME/PotreeConverter/build/PotreeConverter}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -x "$HOME/miniconda3/bin/python" ]]; then
+    DEFAULT_PYTHON_BIN="$HOME/miniconda3/bin/python"
+else
+    DEFAULT_PYTHON_BIN="python3"
+fi
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}"
 LAS_BBOX_REPAIR_SCRIPT="$SCRIPT_DIR/repair_las_bounding_box.py"
+GROUND_REMAP_SCRIPT="$SCRIPT_DIR/remap_unclassified_ground.py"
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
 MIN_FREE_BYTES=0
 MAX_SECTORS=0
@@ -254,6 +260,13 @@ preflight() {
         die "required command not found: $PYTHON_BIN"
     [[ -f "$LAS_BBOX_REPAIR_SCRIPT" ]] ||
         die "LAS bounding-box repair helper not found: $LAS_BBOX_REPAIR_SCRIPT"
+    [[ -f "$GROUND_REMAP_SCRIPT" ]] ||
+        die "ground classification helper not found: $GROUND_REMAP_SCRIPT"
+
+    if [[ "$RUN_PDAL_CLEANING" == true ]]; then
+        "$PYTHON_BIN" -c 'import laspy, lazrs, numpy' >/dev/null 2>&1 ||
+            die "PYTHON_BIN must provide laspy, lazrs, and numpy: $PYTHON_BIN"
+    fi
 
     local conda_init=""
     if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
@@ -574,6 +587,7 @@ collect_laz_files() {
         -type f \
         -name '*.laz' \
         ! -name '*_clean.laz' \
+        ! -name '*.ground-remap.*.laz' \
         -print0
 }
 
@@ -741,9 +755,28 @@ ensure_source_manifest() {
 process_laz_file() {
     local file="$1"
     local temp_file="${file%.laz}_clean.laz"
+    local remap_file
+    local remap_result
+    local input_file="$file"
     local range_limits='Overlap[0:0],Classification[1:7],Z[:600]'
 
     rm -f "$temp_file"
+
+    remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
+    rm -f -- "$remap_file"
+
+    if ! remap_result="$("$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" "$file" "$remap_file")"; then
+        rm -f -- "$remap_file"
+        return 1
+    fi
+
+    if [[ "$(jq -r '.remapped' <<< "$remap_result")" == true ]]; then
+        input_file="$remap_file"
+        event "class1-ground-remap" "$CURRENT_SECTOR" \
+            "file=$file;class1Points=$(jq -r '.class1Points' <<< "$remap_result");class1Share=$(jq -r '.class1Share' <<< "$remap_result");groundLikeFraction=$(jq -r '.groundLikeFraction' <<< "$remap_result")"
+    else
+        rm -f -- "$remap_file"
+    fi
 
     # Older LAS point formats have no overlap flag. In that case every point is
     # implicitly non-overlap, so omitting only that unavailable predicate keeps
@@ -754,20 +787,23 @@ process_laz_file() {
         range_limits='Classification[1:7],Z[:600]'
     fi
 
-    pdal translate "$file" "$temp_file" \
+    if ! pdal translate "$input_file" "$temp_file" \
         range \
         --filters.range.limits="$range_limits" \
         --writers.las.forward='vlr' \
         --writers.las.minor_version=2 \
-        --writers.las.dataformat_id=0 &&
-        mv "$temp_file" "$file"
+        --writers.las.dataformat_id=0; then
+        rm -f -- "$temp_file" "$remap_file"
+        return 1
+    fi
+
+    rm -f -- "$remap_file"
+    mv "$temp_file" "$file"
 }
 
 export -f process_laz_file
 
 clean_laz_files() {
-    [[ "$RUN_PDAL_CLEANING" == true ]] || return 0
-
     local pdal_failure_dir="$CURRENT_TARGET_DIR/.pdal-failures"
     local xargs_status=0
     local marker
@@ -777,9 +813,17 @@ clean_laz_files() {
 
     rm -rf -- "$pdal_failure_dir" || return 1
     mkdir -p -- "$pdal_failure_dir" "$SKIPPED_LAZ_DIR/$CURRENT_SECTOR" || return 1
+    find "$CURRENT_TARGET_DIR" \
+        -type f \
+        -name '*.ground-remap.*.laz' \
+        -delete || return 1
+
+    [[ "$RUN_PDAL_CLEANING" == true ]] || return 0
 
     PDAL_FAILURE_DIR="$pdal_failure_dir"
     export PDAL_FAILURE_DIR
+    export GROUND_REMAP_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR
+    export -f timestamp event process_laz_file
 
     collect_laz_files |
         xargs -0 -r -n 1 -P "$MAX_JOBS" \

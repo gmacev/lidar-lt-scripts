@@ -219,6 +219,15 @@ EOF
     as_target install -m 755 "$wrapper_tmp" "$wrapper"
 }
 
+install_las_processing_python() {
+    log "Installing Python LAS/LAZ processing dependencies"
+    as_target "$CONDA_DIR/bin/python" -m pip install \
+        --upgrade \
+        laspy \
+        lazrs \
+        numpy
+}
+
 install_potree_converter() {
     local archive="$TEMP_DIR/PotreeConverter_${POTREE_VERSION}_x64_linux.zip"
     local extract_dir="$TEMP_DIR/potree-extract"
@@ -293,6 +302,10 @@ verify_installation() {
     [[ "$pdal_version" == *"$PDAL_VERSION"* ]] ||
         die "unexpected PDAL version: $pdal_version"
 
+    as_target "$CONDA_DIR/bin/python" -c \
+        'import laspy, lazrs, numpy; print(f"laspy={laspy.__version__}")' >/dev/null ||
+        die "laspy/lazrs/numpy verification failed"
+
     as_target "$POTREE_ENTRYPOINT" --help > "$potree_help" 2>&1
     grep -q 'PotreeConverter <source> -o <outdir>' "$potree_help" ||
         die "PotreeConverter verification failed"
@@ -317,6 +330,7 @@ main() {
     install_ubuntu_packages
     install_miniforge
     install_pdal
+    install_las_processing_python
     install_potree_converter
     prepare_default_output_directory
     verify_installation
