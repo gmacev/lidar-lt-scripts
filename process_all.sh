@@ -26,6 +26,7 @@ MAX_SECTORS=0
 KEEP_LAZ=false
 REPROCESS=false
 SECTOR_LIST_FILE=""
+GROUND_REMAP_ENABLED=false
 REMAP_CLASS1_GROUND=false
 
 FAILED_LOG=""
@@ -70,6 +71,8 @@ Options:
   --max-jobs N          Parallel PDAL jobs per sector (default: 4)
   --skip-pdal           Skip PDAL cleaning, but still generate metadata with PDAL
   --keep-laz            Keep source LAZ files after successful conversion
+  --remap-unclassified-ground
+                        Opt in to sector-wide class-1 to ground remapping (off by default)
   --reprocess           Clean and rebuild the explicitly selected sectors from scratch
                         (requires --sector or --sector-list; never reprocesses the whole grid by accident)
   -h, --help            Show this help
@@ -189,6 +192,10 @@ parse_args() {
                 KEEP_LAZ=true
                 shift
                 ;;
+            --remap-unclassified-ground)
+                GROUND_REMAP_ENABLED=true
+                shift
+                ;;
             --reprocess)
                 REPROCESS=true
                 shift
@@ -261,10 +268,10 @@ preflight() {
         die "required command not found: $PYTHON_BIN"
     [[ -f "$LAS_BBOX_REPAIR_SCRIPT" ]] ||
         die "LAS bounding-box repair helper not found: $LAS_BBOX_REPAIR_SCRIPT"
-    [[ -f "$GROUND_REMAP_SCRIPT" ]] ||
-        die "ground classification helper not found: $GROUND_REMAP_SCRIPT"
 
-    if [[ "$RUN_PDAL_CLEANING" == true ]]; then
+    if [[ "$GROUND_REMAP_ENABLED" == true && "$RUN_PDAL_CLEANING" == true ]]; then
+        [[ -f "$GROUND_REMAP_SCRIPT" ]] ||
+            die "ground classification helper not found: $GROUND_REMAP_SCRIPT"
         "$PYTHON_BIN" -c 'import laspy, lazrs, numpy' >/dev/null 2>&1 ||
             die "PYTHON_BIN must provide laspy, lazrs, and numpy: $PYTHON_BIN"
     fi
@@ -756,16 +763,15 @@ ensure_source_manifest() {
 process_laz_file() {
     local file="$1"
     local temp_file="${file%.laz}_clean.laz"
-    local remap_file
+    local remap_file=""
     local input_file="$file"
     local range_limits='Overlap[0:0],Classification[1:7],Z[:600]'
 
     rm -f "$temp_file"
 
-    remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
-    rm -f -- "$remap_file"
-
     if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+        remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
+        rm -f -- "$remap_file"
         if ! "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
             --remap-only "$file" "$remap_file"; then
             rm -f -- "$remap_file"
@@ -791,11 +797,12 @@ process_laz_file() {
         --writers.las.forward='vlr' \
         --writers.las.minor_version=2 \
         --writers.las.dataformat_id=0; then
-        rm -f -- "$temp_file" "$remap_file"
+        rm -f -- "$temp_file"
+        [[ -z "$remap_file" ]] || rm -f -- "$remap_file"
         return 1
     fi
 
-    rm -f -- "$remap_file"
+    [[ -z "$remap_file" ]] || rm -f -- "$remap_file"
     mv "$temp_file" "$file"
 }
 
@@ -826,7 +833,8 @@ clean_laz_files() {
         REMAP_CLASS1_GROUND
     export -f timestamp event process_laz_file
 
-    ground_remap_analysis="$(
+    if [[ "$GROUND_REMAP_ENABLED" == true ]]; then
+        ground_remap_analysis="$(
         collect_laz_files |
             xargs -0 -r -n 1 -P "$MAX_JOBS" \
                 bash -c '
@@ -898,29 +906,30 @@ clean_laz_files() {
                     }
                 end
             '
-    )" || {
-        unset PDAL_FAILURE_DIR
-        return 1
-    }
+        )" || {
+            unset PDAL_FAILURE_DIR
+            return 1
+        }
 
-    REMAP_CLASS1_GROUND="$(jq -r '.remapped' <<< "$ground_remap_analysis")" || {
-        unset PDAL_FAILURE_DIR
-        return 1
-    }
-    [[ "$REMAP_CLASS1_GROUND" == true || "$REMAP_CLASS1_GROUND" == false ]] || {
-        unset PDAL_FAILURE_DIR
-        return 1
-    }
-    ground_remap_detail="$(
-        jq -r '"scope=sector;files=\(.fileCount);analysisFailedFiles=\(.analysisFailedFiles);class1Points=\(.class1Points);class1Share=\(.class1Share);groundLikeFraction=\(.groundLikeFraction);remapped=\(.remapped)"' \
-            <<< "$ground_remap_analysis"
-    )" || {
-        unset PDAL_FAILURE_DIR
-        return 1
-    }
-    event "class1-ground-remap-scan" "$CURRENT_SECTOR" "$ground_remap_detail"
-    if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
-        event "class1-ground-remap" "$CURRENT_SECTOR" "$ground_remap_detail"
+        REMAP_CLASS1_GROUND="$(jq -r '.remapped' <<< "$ground_remap_analysis")" || {
+            unset PDAL_FAILURE_DIR
+            return 1
+        }
+        [[ "$REMAP_CLASS1_GROUND" == true || "$REMAP_CLASS1_GROUND" == false ]] || {
+            unset PDAL_FAILURE_DIR
+            return 1
+        }
+        ground_remap_detail="$(
+            jq -r '"scope=sector;files=\(.fileCount);analysisFailedFiles=\(.analysisFailedFiles);class1Points=\(.class1Points);class1Share=\(.class1Share);groundLikeFraction=\(.groundLikeFraction);remapped=\(.remapped)"' \
+                <<< "$ground_remap_analysis"
+        )" || {
+            unset PDAL_FAILURE_DIR
+            return 1
+        }
+        event "class1-ground-remap-scan" "$CURRENT_SECTOR" "$ground_remap_detail"
+        if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+            event "class1-ground-remap" "$CURRENT_SECTOR" "$ground_remap_detail"
+        fi
     fi
 
     collect_laz_files |

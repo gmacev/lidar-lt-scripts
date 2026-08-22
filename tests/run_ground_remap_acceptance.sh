@@ -10,10 +10,14 @@ GRID_FILE="$TEST_ROOT/grid.geojson"
 SOURCE_DIR="$DATA_ROOT/01_01/01_01"
 SOURCE_FILE_A="$SOURCE_DIR/affected.laz"
 SOURCE_FILE_B="$SOURCE_DIR/below-file-threshold.laz"
+DEFAULT_DATA_ROOT="$TEST_ROOT/default-data"
+DEFAULT_SOURCE_DIR="$DEFAULT_DATA_ROOT/01_01/01_01"
+DEFAULT_SOURCE_FILE_A="$DEFAULT_SOURCE_DIR/affected.laz"
+DEFAULT_SOURCE_FILE_B="$DEFAULT_SOURCE_DIR/below-file-threshold.laz"
 POTREE_CONVERTER_BIN="${POTREE_CONVERTER:-/opt/potreeconverter-2.1.1/PotreeConverter_linux_x64/PotreeConverter}"
 
 rm -rf "$TEST_ROOT"
-mkdir -p "$SOURCE_DIR"
+mkdir -p "$SOURCE_DIR" "$DEFAULT_SOURCE_DIR"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 if [[ ! -x "$POTREE_CONVERTER_BIN" ]]; then
@@ -37,7 +41,9 @@ cat > "$GRID_FILE" <<'EOF'
 }
 EOF
 
-python3 - "$SOURCE_FILE_A" "$SOURCE_FILE_B" <<'PY'
+python3 - \
+    "$SOURCE_FILE_A" "$SOURCE_FILE_B" \
+    "$DEFAULT_SOURCE_FILE_A" "$DEFAULT_SOURCE_FILE_B" <<'PY'
 import sys
 from pathlib import Path
 
@@ -67,9 +73,12 @@ def write_fixture(path: Path, class1_count: int, class12_count: int, x_offset: f
 
 write_fixture(Path(sys.argv[1]), class1_count=12_000, class12_count=1_000, x_offset=0)
 write_fixture(Path(sys.argv[2]), class1_count=500, class12_count=12_500, x_offset=200)
+write_fixture(Path(sys.argv[3]), class1_count=12_000, class12_count=1_000, x_offset=0)
+write_fixture(Path(sys.argv[4]), class1_count=500, class12_count=12_500, x_offset=200)
 PY
 
 touch "$DATA_ROOT/01_01/.download_complete"
+touch "$DEFAULT_DATA_ROOT/01_01/.download_complete"
 
 PYTHON_BIN=python3 \
 POTREE_CONVERTER="$POTREE_CONVERTER_BIN" \
@@ -77,6 +86,35 @@ MIN_FREE_GB=1 \
 bash "$REPO_DIR/process_all.sh" \
     --grid "$GRID_FILE" \
     --sector 01_01 \
+    --download-dir "$DEFAULT_DATA_ROOT" \
+    --keep-laz
+
+if grep -q 'class1-ground-remap' "$DEFAULT_DATA_ROOT/pipeline_events.log"; then
+    echo "FAIL: default processing unexpectedly ran class-1 ground remapping" >&2
+    exit 1
+fi
+test -z "$(find "$DEFAULT_SOURCE_DIR" -type f -name '*.ground-remap.*.laz' -print -quit)"
+python3 - "$DEFAULT_SOURCE_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+import laspy
+
+source_dir = Path(sys.argv[1])
+class1_points = sum(
+    int((laspy.read(path).classification == 1).sum())
+    for path in source_dir.glob("*.laz")
+)
+assert class1_points > 0, class1_points
+PY
+
+PYTHON_BIN=python3 \
+POTREE_CONVERTER="$POTREE_CONVERTER_BIN" \
+MIN_FREE_GB=1 \
+bash "$REPO_DIR/process_all.sh" \
+    --grid "$GRID_FILE" \
+    --sector 01_01 \
+    --remap-unclassified-ground \
     --download-dir "$DATA_ROOT"
 
 grep -q $'class1-ground-remap\t01_01' "$DATA_ROOT/pipeline_events.log"
