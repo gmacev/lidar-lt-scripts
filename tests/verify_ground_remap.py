@@ -69,7 +69,8 @@ def main() -> None:
         assert affected["remapped"] is True, affected
         assert affected["class1Points"] == 12_000, affected
         assert affected["class1Share"] > 0.01, affected
-        assert affected["groundLikeFraction"] >= 0.90, affected
+        assert affected["groundLikeFraction"] >= 0.80, affected
+        assert affected["thresholds"]["minGroundLikeFraction"] == 0.80, affected
 
         remapped = laspy.read(affected_output)
         assert int((remapped.classification == 1).sum()) == 0

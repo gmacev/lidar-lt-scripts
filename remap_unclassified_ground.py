@@ -11,7 +11,7 @@ than the survey year or LAS version:
 
 * at least 10,000 class-1 points;
 * class 1 is at least 1% of all source points; and
-* at least 90% of class-1 points are within 0.25 m of the mean class-2 Z in
+* at least 80% of class-1 points are within 0.25 m of the mean class-2 Z in
   their 1 m XY cell.
 
 The production caller aggregates these measurements across every LAZ in a
@@ -37,7 +37,7 @@ CELL_SIZE = 1.0
 GROUND_Z_TOLERANCE = 0.25
 MIN_CLASS1_POINTS = 10_000
 MIN_CLASS1_SHARE = 0.01
-MIN_GROUND_LIKE_FRACTION = 0.90
+MIN_GROUND_LIKE_FRACTION = 0.80
 CHUNK_SIZE = 2_000_000
 MAX_GRID_CELLS = 4_000_000
 
