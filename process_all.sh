@@ -20,6 +20,7 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON_BIN}"
 LAS_BBOX_REPAIR_SCRIPT="$SCRIPT_DIR/repair_las_bounding_box.py"
 GROUND_REMAP_SCRIPT="$SCRIPT_DIR/remap_unclassified_ground.py"
+SECTOR_XY_FILTER_SCRIPT="$SCRIPT_DIR/filter_laz_to_sector.py"
 MIN_FREE_GB="${MIN_FREE_GB:-15}"
 MIN_FREE_BYTES=0
 MAX_SECTORS=0
@@ -278,10 +279,16 @@ preflight() {
     [[ -f "$LAS_BBOX_REPAIR_SCRIPT" ]] ||
         die "LAS bounding-box repair helper not found: $LAS_BBOX_REPAIR_SCRIPT"
 
-    if [[ ("$GROUND_REMAP_ENABLED" == true || "$REMOVE_OUT_OF_SECTOR_XY" == true) &&
-          "$RUN_PDAL_CLEANING" == true ]]; then
+    if [[ "$GROUND_REMAP_ENABLED" == true && "$RUN_PDAL_CLEANING" == true ]]; then
         [[ -f "$GROUND_REMAP_SCRIPT" ]] ||
             die "ground classification helper not found: $GROUND_REMAP_SCRIPT"
+    fi
+    if [[ "$REMOVE_OUT_OF_SECTOR_XY" == true && "$RUN_PDAL_CLEANING" == true ]]; then
+        [[ -f "$SECTOR_XY_FILTER_SCRIPT" ]] ||
+            die "sector XY filter helper not found: $SECTOR_XY_FILTER_SCRIPT"
+    fi
+    if [[ ("$GROUND_REMAP_ENABLED" == true || "$REMOVE_OUT_OF_SECTOR_XY" == true) &&
+          "$RUN_PDAL_CLEANING" == true ]]; then
         "$PYTHON_BIN" -c 'import laspy, lazrs, numpy' >/dev/null 2>&1 ||
             die "PYTHON_BIN must provide laspy, lazrs, and numpy: $PYTHON_BIN"
     fi
@@ -777,54 +784,53 @@ ensure_source_manifest() {
 process_laz_file() {
     local file="$1"
     local temp_file="${file%.laz}_clean.laz"
+    local xy_file=""
     local remap_file=""
-    local rewrite_report=""
+    local xy_report=""
     local xy_detail=""
-    local -a rewrite_args=()
     local input_file="$file"
     local range_limits='Overlap[0:0],Classification[1:7],Z[:600]'
 
     rm -f "$temp_file"
 
     if [[ "$REMOVE_OUT_OF_SECTOR_XY" == true ]]; then
-        remap_file="$(mktemp "${file%.laz}.sector-xy.XXXXXX.laz")" || return 1
-        rm -f -- "$remap_file"
-        rewrite_args=(
-            --rewrite-only "$file" "$remap_file"
-            --remove-out-of-sector-xy
-            --grid-file "$GRID_FILE"
-            --sector-id "$CURRENT_SECTOR"
-            --xy-margin "$XY_MARGIN_METERS"
-        )
-        [[ "$REMAP_CLASS1_GROUND" == true ]] &&
-            rewrite_args+=(--remap-class1)
-        rewrite_report="$(
-            "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" "${rewrite_args[@]}"
+        xy_file="$(mktemp "${file%.laz}.sector-xy.XXXXXX.laz")" || return 1
+        rm -f -- "$xy_file"
+        xy_report="$(
+            "$PYTHON_BIN" "$SECTOR_XY_FILTER_SCRIPT" \
+                --grid-file "$GRID_FILE" \
+                --sector-id "$CURRENT_SECTOR" \
+                --xy-margin "$XY_MARGIN_METERS" \
+                "$file" "$xy_file"
         )" || {
-            rm -f -- "$remap_file"
+            rm -f -- "$xy_file"
             return 1
         }
         xy_detail="$(
             jq -r \
-                'file=\(.source);inputPoints=\(.inputPoints);outputPoints=\(.outputPoints);removedOutOfSectorXYPoints=\(.removedOutOfSectorXYPoints);remappedClass1Points=\(.remappedClass1Points)' \
-                <<< "$rewrite_report"
+                'file=\(.source);inputPoints=\(.inputPoints);outputPoints=\(.outputPoints);removedOutOfSectorXYPoints=\(.removedOutOfSectorXYPoints)' \
+                <<< "$xy_report"
         )" || {
-            rm -f -- "$remap_file"
+            rm -f -- "$xy_file"
             return 1
         }
         event "sector-xy-filter" "$CURRENT_SECTOR" "$xy_detail"
-        input_file="$remap_file"
-    elif [[ "$REMAP_CLASS1_GROUND" == true ]]; then
-        remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
+        input_file="$xy_file"
+    fi
+
+    if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+        remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || {
+            [[ -z "$xy_file" ]] || rm -f -- "$xy_file"
+            return 1
+        }
         rm -f -- "$remap_file"
         if ! "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
-            --remap-only "$file" "$remap_file"; then
+            --remap-only "$input_file" "$remap_file"; then
             rm -f -- "$remap_file"
+            [[ -z "$xy_file" ]] || rm -f -- "$xy_file"
             return 1
         fi
         input_file="$remap_file"
-    else
-        rm -f -- "$remap_file"
     fi
 
     # Older LAS point formats have no overlap flag. In that case every point is
@@ -844,10 +850,12 @@ process_laz_file() {
         --writers.las.dataformat_id=0; then
         rm -f -- "$temp_file"
         [[ -z "$remap_file" ]] || rm -f -- "$remap_file"
+        [[ -z "$xy_file" ]] || rm -f -- "$xy_file"
         return 1
     fi
 
     [[ -z "$remap_file" ]] || rm -f -- "$remap_file"
+    [[ -z "$xy_file" ]] || rm -f -- "$xy_file"
     mv "$temp_file" "$file"
 }
 
@@ -855,17 +863,32 @@ export -f process_laz_file
 
 analyse_ground_file() {
     local file="$1"
+    local analysis_file="$file"
+    local xy_file=""
+    local status=0
 
     if [[ "$REMOVE_OUT_OF_SECTOR_XY" == true ]]; then
-        "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
-            --analyse-only "$file" \
-            --remove-out-of-sector-xy \
+        xy_file="$(mktemp "${file%.laz}.sector-xy-analysis.XXXXXX.laz")" || return 1
+        rm -f -- "$xy_file"
+        if ! "$PYTHON_BIN" "$SECTOR_XY_FILTER_SCRIPT" \
             --grid-file "$GRID_FILE" \
             --sector-id "$CURRENT_SECTOR" \
-            --xy-margin "$XY_MARGIN_METERS"
-    else
-        "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$file"
+            --xy-margin "$XY_MARGIN_METERS" \
+            "$file" "$xy_file" >/dev/null; then
+            rm -f -- "$xy_file"
+            return 1
+        fi
+        analysis_file="$xy_file"
     fi
+
+    if "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$analysis_file"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    [[ -z "$xy_file" ]] || rm -f -- "$xy_file"
+    return "$status"
 }
 
 export -f analyse_ground_file
@@ -891,7 +914,7 @@ clean_laz_files() {
     [[ "$RUN_PDAL_CLEANING" == true ]] || return 0
 
     PDAL_FAILURE_DIR="$pdal_failure_dir"
-    export PDAL_FAILURE_DIR GROUND_REMAP_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR \
+    export PDAL_FAILURE_DIR GROUND_REMAP_SCRIPT SECTOR_XY_FILTER_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR \
         GRID_FILE REMOVE_OUT_OF_SECTOR_XY XY_MARGIN_METERS REMAP_CLASS1_GROUND
     export -f timestamp event process_laz_file analyse_ground_file
 
