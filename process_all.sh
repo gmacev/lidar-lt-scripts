@@ -841,7 +841,7 @@ clean_laz_files() {
                     if "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$1"; then
                         exit 0
                     fi
-                    printf '{"analysisFailed":true}\n'
+                    printf "%s\n" "{\"analysisFailed\":true}"
                     exit 0
                 ' _ |
             jq -s -c '
