@@ -41,9 +41,9 @@ def create_fixture(path: Path, class1_count: int) -> None:
     las.write(path)
 
 
-def run_helper(source: Path, output: Path) -> dict[str, object]:
+def run_helper_command(arguments: list[str]) -> dict[str, object]:
     result = subprocess.run(
-        [sys.executable, str(HELPER), str(source), str(output)],
+        [sys.executable, str(HELPER), *arguments],
         check=False,
         capture_output=True,
         text=True,
@@ -56,6 +56,10 @@ def run_helper(source: Path, output: Path) -> dict[str, object]:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise AssertionError(f"helper did not return JSON: {result.stdout}") from exc
+
+
+def run_helper(source: Path, output: Path) -> dict[str, object]:
+    return run_helper_command([str(source), str(output)])
 
 
 def main() -> None:
@@ -83,6 +87,87 @@ def main() -> None:
         unaffected = run_helper(unaffected_source, unaffected_output)
         assert unaffected["remapped"] is False, unaffected
         assert not unaffected_output.exists()
+
+        grid_file = root_path / "grid.geojson"
+        grid_file.write_text(
+            json.dumps(
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {"id": "61/33"},
+                            "geometry": {
+                                "type": "Polygon",
+                                "coordinates": [
+                                    [
+                                        [24.07769681037245, 54.76627274319426],
+                                        [24.15539338243744, 54.766198102392636],
+                                        [24.155221501004316, 54.72127324091781],
+                                        [24.07761086920854, 54.721347758400746],
+                                        [24.07769681037245, 54.76627274319426],
+                                    ]
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        xy_source = root_path / "xy-outlier.laz"
+        xy_output = root_path / "xy-outlier-filtered.laz"
+        header = laspy.LasHeader(point_format=3, version="1.2")
+        header.scales = np.array([0.01, 0.01, 0.01])
+        header.offsets = np.array([0.0, 0.0, 0.0])
+        las = laspy.LasData(header)
+        las.x = np.array([505100.0, 505101.0, 505102.0, 519828.96])
+        las.y = np.array([6066000.0, 6066001.0, 6066002.0, 6066696.06])
+        las.z = np.array([100.0, 100.0, 101.0, 56.57])
+        las.classification = np.array([1, 2, 12, 5], dtype=np.uint8)
+        las.write(xy_source)
+
+        xy_report = run_helper_command(
+            [
+                "--rewrite-only",
+                str(xy_source),
+                str(xy_output),
+                "--remove-out-of-sector-xy",
+                "--grid-file",
+                str(grid_file),
+                "--sector-id",
+                "61_33",
+                "--xy-margin",
+                "25",
+                "--remap-class1",
+            ]
+        )
+        assert xy_report["inputPoints"] == 4, xy_report
+        assert xy_report["outputPoints"] == 3, xy_report
+        assert xy_report["removedOutOfSectorXYPoints"] == 1, xy_report
+        assert xy_report["remappedClass1Points"] == 1, xy_report
+
+        filtered = laspy.read(xy_output)
+        assert len(filtered.points) == 3
+        assert int((filtered.classification == 1).sum()) == 0
+        assert int((filtered.classification == 2).sum()) == 2
+        assert float(filtered.x.max()) < 510025.0
+
+        analysed = run_helper_command(
+            [
+                "--analyse-only",
+                str(xy_source),
+                "--remove-out-of-sector-xy",
+                "--grid-file",
+                str(grid_file),
+                "--sector-id",
+                "61_33",
+                "--xy-margin",
+                "25",
+            ]
+        )
+        assert analysed["totalPoints"] == 3, analysed
 
     print("PASS: class-1 ground-remap trigger selects affected and skips unaffected LAS")
 

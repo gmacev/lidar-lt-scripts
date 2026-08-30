@@ -27,6 +27,8 @@ KEEP_LAZ=false
 REPROCESS=false
 SECTOR_LIST_FILE=""
 GROUND_REMAP_ENABLED=false
+REMOVE_OUT_OF_SECTOR_XY=false
+XY_MARGIN_METERS="${XY_MARGIN_METERS:-25}"
 REMAP_CLASS1_GROUND=false
 
 FAILED_LOG=""
@@ -73,13 +75,16 @@ Options:
   --keep-laz            Keep source LAZ files after successful conversion
   --remap-unclassified-ground
                         Opt in to sector-wide class-1 to ground remapping (off by default)
+  --remove-out-of-sector-xy
+                        Opt in to removing source points outside the sector XY bbox
   --reprocess           Clean and rebuild the explicitly selected sectors from scratch
                         (requires --sector or --sector-list; never reprocesses the whole grid by accident)
   -h, --help            Show this help
 
 Environment overrides:
   GRID_FILE, DOWNLOAD_DIR, MAX_JOBS, RUN_PDAL_CLEANING, POTREE_ENCODING,
-  POTREE_CONVERTER, PYTHON_BIN, MIN_FREE_GB (default: 15)
+  POTREE_CONVERTER, PYTHON_BIN, MIN_FREE_GB (default: 15),
+  XY_MARGIN_METERS (default: 25)
 
 If an individual LAZ file fails PDAL cleaning, it is quarantined and omitted
 from Potree conversion; the sector is marked partial in source_manifest.json
@@ -196,6 +201,10 @@ parse_args() {
                 GROUND_REMAP_ENABLED=true
                 shift
                 ;;
+            --remove-out-of-sector-xy)
+                REMOVE_OUT_OF_SECTOR_XY=true
+                shift
+                ;;
             --reprocess)
                 REPROCESS=true
                 shift
@@ -269,12 +278,16 @@ preflight() {
     [[ -f "$LAS_BBOX_REPAIR_SCRIPT" ]] ||
         die "LAS bounding-box repair helper not found: $LAS_BBOX_REPAIR_SCRIPT"
 
-    if [[ "$GROUND_REMAP_ENABLED" == true && "$RUN_PDAL_CLEANING" == true ]]; then
+    if [[ ("$GROUND_REMAP_ENABLED" == true || "$REMOVE_OUT_OF_SECTOR_XY" == true) &&
+          "$RUN_PDAL_CLEANING" == true ]]; then
         [[ -f "$GROUND_REMAP_SCRIPT" ]] ||
             die "ground classification helper not found: $GROUND_REMAP_SCRIPT"
         "$PYTHON_BIN" -c 'import laspy, lazrs, numpy' >/dev/null 2>&1 ||
             die "PYTHON_BIN must provide laspy, lazrs, and numpy: $PYTHON_BIN"
     fi
+
+    [[ "$XY_MARGIN_METERS" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        die "XY_MARGIN_METERS must be a non-negative decimal number"
 
     local conda_init=""
     if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
@@ -596,6 +609,7 @@ collect_laz_files() {
         -name '*.laz' \
         ! -name '*_clean.laz' \
         ! -name '*.ground-remap.*.laz' \
+        ! -name '*.sector-xy.*.laz' \
         -print0
 }
 
@@ -764,12 +778,43 @@ process_laz_file() {
     local file="$1"
     local temp_file="${file%.laz}_clean.laz"
     local remap_file=""
+    local rewrite_report=""
+    local xy_detail=""
+    local -a rewrite_args=()
     local input_file="$file"
     local range_limits='Overlap[0:0],Classification[1:7],Z[:600]'
 
     rm -f "$temp_file"
 
-    if [[ "$REMAP_CLASS1_GROUND" == true ]]; then
+    if [[ "$REMOVE_OUT_OF_SECTOR_XY" == true ]]; then
+        remap_file="$(mktemp "${file%.laz}.sector-xy.XXXXXX.laz")" || return 1
+        rm -f -- "$remap_file"
+        rewrite_args=(
+            --rewrite-only "$file" "$remap_file"
+            --remove-out-of-sector-xy
+            --grid-file "$GRID_FILE"
+            --sector-id "$CURRENT_SECTOR"
+            --xy-margin "$XY_MARGIN_METERS"
+        )
+        [[ "$REMAP_CLASS1_GROUND" == true ]] &&
+            rewrite_args+=(--remap-class1)
+        rewrite_report="$(
+            "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" "${rewrite_args[@]}"
+        )" || {
+            rm -f -- "$remap_file"
+            return 1
+        }
+        xy_detail="$(
+            jq -r \
+                'file=\(.source);inputPoints=\(.inputPoints);outputPoints=\(.outputPoints);removedOutOfSectorXYPoints=\(.removedOutOfSectorXYPoints);remappedClass1Points=\(.remappedClass1Points)' \
+                <<< "$rewrite_report"
+        )" || {
+            rm -f -- "$remap_file"
+            return 1
+        }
+        event "sector-xy-filter" "$CURRENT_SECTOR" "$xy_detail"
+        input_file="$remap_file"
+    elif [[ "$REMAP_CLASS1_GROUND" == true ]]; then
         remap_file="$(mktemp "${file%.laz}.ground-remap.XXXXXX.laz")" || return 1
         rm -f -- "$remap_file"
         if ! "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
@@ -808,6 +853,23 @@ process_laz_file() {
 
 export -f process_laz_file
 
+analyse_ground_file() {
+    local file="$1"
+
+    if [[ "$REMOVE_OUT_OF_SECTOR_XY" == true ]]; then
+        "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" \
+            --analyse-only "$file" \
+            --remove-out-of-sector-xy \
+            --grid-file "$GRID_FILE" \
+            --sector-id "$CURRENT_SECTOR" \
+            --xy-margin "$XY_MARGIN_METERS"
+    else
+        "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$file"
+    fi
+}
+
+export -f analyse_ground_file
+
 clean_laz_files() {
     local pdal_failure_dir="$CURRENT_TARGET_DIR/.pdal-failures"
     local xargs_status=0
@@ -822,7 +884,7 @@ clean_laz_files() {
     mkdir -p -- "$pdal_failure_dir" "$SKIPPED_LAZ_DIR/$CURRENT_SECTOR" || return 1
     find "$CURRENT_TARGET_DIR" \
         -type f \
-        -name '*.ground-remap.*.laz' \
+        \( -name '*.ground-remap.*.laz' -o -name '*.sector-xy.*.laz' \) \
         -delete || return 1
 
     REMAP_CLASS1_GROUND=false
@@ -830,15 +892,15 @@ clean_laz_files() {
 
     PDAL_FAILURE_DIR="$pdal_failure_dir"
     export PDAL_FAILURE_DIR GROUND_REMAP_SCRIPT PYTHON_BIN EVENT_LOG CURRENT_SECTOR \
-        REMAP_CLASS1_GROUND
-    export -f timestamp event process_laz_file
+        GRID_FILE REMOVE_OUT_OF_SECTOR_XY XY_MARGIN_METERS REMAP_CLASS1_GROUND
+    export -f timestamp event process_laz_file analyse_ground_file
 
     if [[ "$GROUND_REMAP_ENABLED" == true ]]; then
         ground_remap_analysis="$(
         collect_laz_files |
             xargs -0 -r -n 1 -P "$MAX_JOBS" \
                 bash -c '
-                    if "$PYTHON_BIN" "$GROUND_REMAP_SCRIPT" --analyse-only "$1"; then
+                    if analyse_ground_file "$1"; then
                         exit 0
                     fi
                     printf "%s\n" "{\"analysisFailed\":true}"
