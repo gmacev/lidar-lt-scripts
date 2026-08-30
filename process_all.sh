@@ -808,7 +808,7 @@ process_laz_file() {
         }
         xy_detail="$(
             jq -r \
-                'file=\(.source);inputPoints=\(.inputPoints);outputPoints=\(.outputPoints);removedOutOfSectorXYPoints=\(.removedOutOfSectorXYPoints)' \
+                '"file=\(.source);inputPoints=\(.inputPoints);outputPoints=\(.outputPoints);removedOutOfSectorXYPoints=\(.removedOutOfSectorXYPoints)"' \
                 <<< "$xy_report"
         )" || {
             rm -f -- "$xy_file"
